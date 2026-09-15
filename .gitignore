@@ -1,0 +1,10 @@
+.DS_Store
+.env
+.aws/
+*.pem
+*.key
+credentials
+terraform.tfstate
+terraform.tfstate.*
+.terraform/
+.local-values.txt
