@@ -18,7 +18,7 @@ BLACKSITE was designed around one primary constraint:
 
 The environment therefore avoids a public IPv4 address, Internet Gateway, NAT Gateway, SSH key pair, and inbound administrative ports.
 
-Instead, administration and service access occur through AWS-managed private connectivity.
+Instead, administration and AWS service access occur through private AWS connectivity and IAM-based authorization.
 
 ---
 
@@ -56,13 +56,13 @@ flowchart TD
 
     end
 
-    Admin -->|Session Manager| SSM
+    Admin -->|Starts Session| SSM
 
-    SSM --> SSMEP
-    SSM --> MSGEP
+    EC2 -->|SSM Agent HTTPS 443| SSMEP
+    EC2 -->|Session Channel HTTPS 443| MSGEP
 
-    SSMEP --> EC2
-    MSGEP --> EC2
+    SSMEP --> SSM
+    MSGEP --> SSM
 
     IAM -->|Temporary Credentials| EC2
 
@@ -71,6 +71,10 @@ flowchart TD
 
     Admin -->|Management API Activity| CT
 ```
+
+The EC2 instance initiates outbound HTTPS connections to the Systems Manager interface endpoints. AWS does not initiate an inbound administrative connection to the instance.
+
+This allows the workload to maintain **zero inbound security-group rules** while still supporting Session Manager administration.
 
 ---
 
@@ -88,9 +92,21 @@ The BLACKSITE workload was deployed inside:
 | SSH key pair | None |
 | EC2 inbound rules | None |
 
-The subnet route table contained only local VPC routing and the AWS-managed prefix-list route required by the S3 gateway endpoint.
+The subnet route table contained local VPC routing and the AWS-managed prefix-list route associated with the S3 gateway endpoint.
 
-There was no `0.0.0.0/0` route to an Internet Gateway or NAT Gateway.
+There was no:
+
+```text
+0.0.0.0/0 → Internet Gateway
+```
+
+or:
+
+```text
+0.0.0.0/0 → NAT Gateway
+```
+
+default route.
 
 ---
 
@@ -103,15 +119,21 @@ Instead, the EC2 instance was managed using **AWS Systems Manager Session Manage
 Private interface endpoints provided connectivity to:
 
 ```text
-com.amazonaws.<region>.ssm
-com.amazonaws.<region>.ssmmessages
+com.amazonaws.us-east-2.ssm
+com.amazonaws.us-east-2.ssmmessages
 ```
 
 The endpoint security group allowed HTTPS on TCP port `443` from the EC2 workload security group.
 
 The EC2 security group itself contained **zero inbound rules**.
 
-This allowed administrative sessions without exposing port `22` or assigning the instance a public address.
+The Systems Manager agent running on the EC2 instance initiated HTTPS connections to the private endpoints, allowing Session Manager to operate without:
+
+- a public IPv4 address
+- inbound TCP port `22`
+- an SSH key pair
+- an Internet Gateway
+- a NAT Gateway
 
 ---
 
@@ -132,7 +154,7 @@ AmazonSSMManagedInstanceCore
 BlacksiteS3ScopedAccess
 ```
 
-The custom S3 policy restricted the workload to:
+The custom S3 policy restricted workload access to:
 
 ```text
 allowed/
@@ -155,7 +177,7 @@ Delete objects
 Access unrelated S3 resources
 ```
 
-The authorization boundary was tested directly rather than assumed from the policy configuration.
+The authorization boundary was tested directly rather than assumed from policy configuration alone.
 
 ---
 
@@ -165,14 +187,16 @@ The EC2 workload accessed Amazon S3 through an **S3 Gateway VPC Endpoint**.
 
 ```mermaid
 flowchart LR
-    EC2["Private EC2"] -->|"AWS CLI request"| Endpoint["S3 Gateway Endpoint"]
+    EC2["Private EC2"] -->|"AWS CLI Request"| Endpoint["S3 Gateway Endpoint"]
     Endpoint --> Bucket["Private S3 Bucket"]
 
-    Bucket --> Allowed["allowed/<br/>ACCESS GRANTED"]
-    Bucket --> Restricted["restricted/<br/>ACCESS DENIED"]
+    Bucket --> Allowed["allowed/<br/>AUTHORIZED"]
+    Bucket --> Restricted["restricted/<br/>DENIED"]
 ```
 
 This allowed the instance to communicate with S3 without requiring a public internet route.
+
+IAM independently determined whether each requested S3 operation was authorized.
 
 ---
 
@@ -188,19 +212,19 @@ The deployed environment was tested using both positive and negative authorizati
 | Download `restricted/admin-only.txt` | Deny | ✅ PASS |
 | List `restricted/` | Deny | ✅ PASS |
 
-The restricted read returned:
+The restricted object read returned:
 
 ```text
 403 Forbidden
 ```
 
-and the restricted prefix listing returned:
+The restricted prefix listing returned:
 
 ```text
 AccessDenied
 ```
 
-confirming that the instance role could not access resources outside its authorized scope.
+These results confirmed that the EC2 role could perform the intended operations while access outside its authorized S3 scope was rejected.
 
 ---
 
@@ -208,7 +232,13 @@ confirming that the instance role could not access resources outside its authori
 
 AWS CloudTrail Event History was used to inspect administrative activity within the environment.
 
-A controlled EC2 `CreateTags` operation was generated and traced through CloudTrail.
+A controlled EC2:
+
+```text
+CreateTags
+```
+
+operation was generated and traced through CloudTrail.
 
 The event record exposed information including:
 
@@ -235,13 +265,13 @@ This provided visibility into:
 
 | Risk | BLACKSITE Control |
 |---|---|
-| Public administrative exposure | No public IP and no inbound EC2 rules |
-| Exposed SSH service | Systems Manager replaces SSH |
+| Public administrative exposure | No public IPv4 and no inbound EC2 rules |
+| Exposed SSH service | Systems Manager Session Manager replaces SSH |
 | Long-lived AWS credentials | EC2 IAM role provides temporary credentials |
 | Excessive S3 permissions | Prefix-scoped IAM policy |
 | Unauthorized storage access | Positive and negative authorization testing |
 | Public S3 exposure | S3 Block Public Access |
-| Internet dependency | Private AWS service endpoints |
+| General internet dependency | Private AWS service endpoints |
 | Untracked infrastructure changes | CloudTrail Event History |
 | Weak metadata access | IMDSv2 required |
 
@@ -252,24 +282,30 @@ This provided visibility into:
 ```text
 Administrator
       |
-      | Session Manager
+      | Starts Session Manager session
       v
-Systems Manager
+AWS Systems Manager
+      ^
       |
-      | Private interface endpoints
+      | Private SSM / SSMMessages endpoints
+      |
+EC2 SSM Agent
+      |
+      | S3 request using temporary IAM credentials
       v
-Private EC2 Instance
+S3 Gateway Endpoint
       |
-      | Temporary IAM role credentials
-      |
-      | S3 gateway endpoint
       v
 Private S3 Bucket
       |
-      +---- allowed/       GRANTED
+      +---- allowed/       AUTHORIZED
       |
       +---- restricted/    DENIED
 ```
+
+The critical distinction is that the **EC2 instance initiates the Systems Manager connectivity**.
+
+No inbound administrative connection is opened to the workload.
 
 Administrative AWS API activity is independently visible through CloudTrail Event History.
 
@@ -279,23 +315,31 @@ Administrative AWS API activity is independently visible through CloudTrail Even
 
 ### Why no public IPv4 address?
 
-The workload did not require direct inbound internet connectivity. Removing the public address reduced unnecessary exposure.
+The workload did not require direct inbound internet connectivity.
+
+Removing the public address reduced unnecessary public exposure.
 
 ### Why no SSH?
 
-Session Manager provided administrative shell access without opening port `22` or managing SSH keys.
+Session Manager provided administrative shell access without exposing port `22` or requiring SSH key management.
 
 ### Why use an IAM role?
 
-An EC2 IAM role provides temporary credentials automatically and avoids storing long-lived AWS access keys on the host.
+An EC2 IAM role provides temporary AWS credentials automatically and avoids storing long-lived access keys on the host.
+
+### Why use Systems Manager interface endpoints?
+
+The interface endpoints allowed the private EC2 workload to communicate with Systems Manager without requiring general internet connectivity.
 
 ### Why use an S3 gateway endpoint?
 
-The gateway endpoint allowed S3 access from the private subnet without requiring an Internet Gateway or NAT Gateway.
+The gateway endpoint allowed S3 access from the VPC without requiring an Internet Gateway or NAT Gateway.
 
 ### Why perform denied-access tests?
 
-A policy that looks correct is not the same as a policy that has been validated. Negative tests confirmed that the intended authorization boundary was actually enforced.
+A policy that appears correct is not necessarily a policy that behaves correctly.
+
+Negative tests confirmed that the intended authorization boundary was actually enforced by AWS.
 
 ---
 
@@ -321,7 +365,7 @@ Key evidence includes:
 
 BLACKSITE is a controlled security lab rather than a production architecture.
 
-The implementation currently uses:
+The implementation used:
 
 - One AWS Region
 - One Availability Zone
@@ -331,4 +375,6 @@ The implementation currently uses:
 - No automated remediation
 - No production or sensitive data
 
-The live AWS infrastructure was intentionally removed after validation. The repository preserves the architecture, policies, automation, test results, and evidence.
+The live AWS infrastructure was intentionally removed after validation.
+
+The repository preserves the architecture, IAM policy, automation, validation results, and supporting evidence.
