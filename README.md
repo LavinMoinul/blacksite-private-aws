@@ -16,7 +16,7 @@ A security-focused AWS lab built around **private administration, least-privileg
 
 BLACKSITE is a private AWS environment designed to minimize unnecessary public exposure while preserving secure administrative access.
 
-The environment contains an Amazon Linux EC2 workload deployed with:
+The Amazon Linux EC2 workload was deployed with:
 
 - **No public IPv4 address**
 - **No inbound security-group rules**
@@ -24,9 +24,11 @@ The environment contains an Amazon Linux EC2 workload deployed with:
 - **No NAT Gateway**
 - **No SSH key pair**
 
-Instead of exposing SSH to the internet, the instance is administered through **AWS Systems Manager Session Manager** using private VPC interface endpoints.
+Instead of exposing SSH, the instance is administered through **AWS Systems Manager Session Manager**.
 
-The workload accesses Amazon S3 through an **S3 gateway endpoint** and receives temporary AWS permissions through an **EC2 IAM instance role** rather than stored access keys.
+The EC2 Systems Manager agent initiates outbound HTTPS connections through private VPC interface endpoints, allowing administrative access without opening an inbound management port.
+
+Amazon S3 access is provided through an **S3 gateway endpoint**, while AWS permissions are delivered through an **EC2 IAM instance role** rather than stored access keys.
 
 ---
 
@@ -36,9 +38,11 @@ The workload accesses Amazon S3 through an **S3 gateway endpoint** and receives 
 flowchart TD
     Admin["Administrator"]
 
-    SSM["AWS Systems Manager<br/>Private Interface Endpoints"]
+    SSM["AWS Systems Manager<br/>Session Manager"]
 
-    EC2["Amazon Linux EC2<br/>Private Subnet<br/>No Public IP<br/>No Inbound Rules"]
+    Endpoints["SSM + SSMMessages<br/>Interface Endpoints"]
+
+    EC2["Amazon Linux EC2<br/>Private Subnet<br/>No Public IPv4<br/>No Inbound Rules"]
 
     S3EP["S3 Gateway Endpoint"]
 
@@ -46,18 +50,20 @@ flowchart TD
 
     CT["CloudTrail Event History"]
 
-    Admin -->|Session Manager| SSM
-    SSM -->|HTTPS 443| EC2
+    Admin -->|Starts Session| SSM
+
+    EC2 -->|SSM Agent HTTPS 443| Endpoints
+    Endpoints --> SSM
 
     EC2 -->|Private S3 Traffic| S3EP
     S3EP --> S3
 
-    Admin -->|AWS Management Activity| CT
+    Admin -.->|Management Activity Recorded| CT
 ```
 
-The EC2 workload resides entirely inside a private subnet and does not require a conventional internet route for administration or S3 access.
+The EC2 workload remains privately addressed while still supporting administration and AWS service access through private connectivity.
 
-For a more detailed breakdown, see [Architecture](docs/architecture.md).
+For the full network, IAM, and control-flow design, see [Architecture](docs/architecture.md).
 
 ---
 
@@ -67,19 +73,33 @@ For a more detailed breakdown, see [Architecture](docs/architecture.md).
 |---|---|
 | Public exposure | EC2 has no public IPv4 address |
 | Administrative access | AWS Systems Manager Session Manager |
-| Inbound network access | EC2 security group contains zero inbound rules |
+| Inbound access | EC2 security group contains zero inbound rules |
 | Internet routing | No Internet Gateway or NAT Gateway |
+| SSH exposure | No SSH key pair or inbound TCP/22 |
 | AWS credentials | Temporary credentials through an EC2 IAM role |
 | S3 authorization | IAM restricted to the `allowed/` prefix |
-| Private S3 access | S3 gateway VPC endpoint |
+| Private S3 connectivity | S3 gateway VPC endpoint |
+| Private administration | SSM and SSMMessages interface endpoints |
 | Audit visibility | AWS CloudTrail Event History |
 | Metadata security | IMDSv2 required |
 
 ---
 
-## Least-Privilege Validation
+## Least-Privilege IAM
 
-The EC2 role was intentionally scoped so the workload could access:
+The EC2 workload operated under:
+
+```text
+BlacksiteEC2Role
+```
+
+with a custom policy:
+
+```text
+BlacksiteS3ScopedAccess
+```
+
+The workload was authorized to access:
 
 ```text
 allowed/
@@ -91,7 +111,30 @@ but not:
 restricted/
 ```
 
-Controlled AWS CLI tests verified the boundary:
+The policy allowed only the required S3 operations within the authorized scope.
+
+### Authorized
+
+```text
+List allowed/
+Read allowed/*
+Write allowed/*
+```
+
+### Denied
+
+```text
+Read restricted/*
+List restricted/
+Delete objects
+Access unrelated S3 resources
+```
+
+---
+
+## Access-Control Validation
+
+The IAM boundary was tested using both positive and negative AWS CLI requests.
 
 | Test | Result |
 |---|---|
@@ -101,13 +144,25 @@ Controlled AWS CLI tests verified the boundary:
 | Read `restricted/` | ✅ DENIED |
 | List `restricted/` | ✅ DENIED |
 
-The denied operations returned `403 Forbidden` / `AccessDenied`, confirming that the workload could not access resources outside its authorized scope.
+Restricted operations returned:
+
+```text
+403 Forbidden
+```
+
+and:
+
+```text
+AccessDenied
+```
+
+confirming that the EC2 role could not access resources outside its intended scope.
 
 ---
 
 ## Automated Validation
 
-A Bash validation script reproduces the primary authorization tests:
+A Bash script reproduces the primary authorization tests:
 
 ```text
 [PASS] Authorized prefix accessible
@@ -124,18 +179,29 @@ Source:
 
 ## Audit Validation
 
-AWS CloudTrail Event History was used to inspect administrative activity performed against the environment.
+AWS CloudTrail Event History was used to inspect management activity performed against the environment.
 
-A controlled EC2 `CreateTags` operation was generated and traced through CloudTrail, including:
+A controlled EC2:
 
-- initiating identity
-- API action
-- event timestamp
-- affected resource
-- request parameters
-- source information
+```text
+CreateTags
+```
 
-This provided an audit trail for security-relevant infrastructure changes.
+operation was generated and located in CloudTrail.
+
+The event record exposed information including:
+
+```text
+userIdentity
+eventTime
+eventSource
+eventName
+sourceIPAddress
+requestParameters
+resources
+```
+
+This demonstrated that administrative AWS activity could be traced by identity, API action, timestamp, and affected resource.
 
 ---
 
@@ -186,19 +252,22 @@ blacksite-private-aws/
 
 ## Threat Model
 
-BLACKSITE was designed around several specific risks:
+BLACKSITE was designed around several specific risks.
 
 **Public administrative exposure**  
-The workload has no public IPv4 address or exposed SSH service. Administration occurs through Systems Manager.
+The workload has no public IPv4 address or exposed inbound administrative service. Administration occurs through Systems Manager.
 
 **Long-lived AWS credentials**  
-The EC2 workload uses temporary credentials supplied through an IAM instance role.
+The workload uses temporary credentials supplied through an EC2 IAM role instead of stored access keys.
 
 **Excessive storage permissions**  
-The role is restricted to the required S3 prefix, with negative tests confirming access outside that scope is denied.
+The IAM role is restricted to the required S3 prefix, with negative authorization tests confirming access outside that scope is denied.
 
-**Public object storage**  
+**Public object exposure**  
 S3 Block Public Access remains enabled.
+
+**Unnecessary internet connectivity**  
+The workload has no Internet Gateway or NAT Gateway route and instead uses private AWS service endpoints.
 
 **Untracked infrastructure changes**  
 CloudTrail Event History provides visibility into AWS management activity.
@@ -207,7 +276,7 @@ See the full [Threat Model](docs/threat-model.md).
 
 ---
 
-## Project Documentation
+## Documentation
 
 - [Architecture](docs/architecture.md)
 - [Threat Model](docs/threat-model.md)
@@ -250,8 +319,8 @@ Potential extensions include:
 
 ## Cleanup
 
-The live AWS infrastructure was intentionally removed after validation to prevent unnecessary consumption of AWS resources.
+The live AWS infrastructure was intentionally removed after validation to avoid leaving unnecessary cloud resources provisioned.
 
-The repository preserves the architecture, security policy, automation, validation results, and supporting evidence.
+The repository preserves the architecture, IAM policy, automation, validation results, and supporting evidence.
 
 See the [Cleanup Runbook](docs/cleanup.md) for the teardown procedure.
